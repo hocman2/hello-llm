@@ -5,7 +5,6 @@ mod the_key;
 use std::env;
 use std::thread;
 use std::sync::mpsc::channel;
-use std::time::Duration;
 use std::process::exit;
 use term::TermTask;
 use request::RequestTask;
@@ -38,7 +37,7 @@ fn main() {
 
     let (tx_ans, rx_ans) = channel();
     let (tx_pro, rx_pro) = channel();
-    let req_thr_handle = thread::spawn(move || {
+    let _req_thr_handle = thread::spawn(move || {
         RequestTask::new().run(tx_ans, rx_pro, prompt);
     });
 

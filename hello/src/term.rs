@@ -4,6 +4,7 @@ use std::time::Duration;
 use crossterm::{queue, execute, cursor, style, event, terminal};
 use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 use std::sync::mpsc::{Receiver, Sender};
+use crate::request::PromptPayload;
 
 // helper founction
 fn last_line_width(buf: &str, last_wrap_idx: usize) -> usize {
@@ -46,7 +47,7 @@ impl TermTask {
     }
 
     fn move_userin_down(&mut self) {
-        let _ = queue!(self.stdout,
+        let _ = execute!(self.stdout,
             style::Print("\n"), // < forces a one line scroll
             cursor::MoveToPreviousLine(1),
             terminal::Clear(terminal::ClearType::CurrentLine),
@@ -60,17 +61,16 @@ impl TermTask {
         let total_userin = Self::USERIN_PREFIX.len() + self.userin_buf.as_str().width() + 1;
         let inpnrow = (total_userin / (tsize.0 as usize) + 1) as u16;
         self.move_userin_down(); 
-        let _ = queue!(self.stdout,
+        let _ = execute!(self.stdout,
             cursor::SavePosition,
             cursor::MoveToPreviousLine(inpnrow),
-            style::Print(s),
+            style::Print(format!("{s}\n")),
             cursor::RestorePosition,
         );
-        self.stdout.flush()?;
         Ok(())
     }
 
-    pub fn run(mut self, tx_pro: Sender<String>, rx_ans: Receiver<String>) -> std::io::Result<()> {
+    pub fn run(mut self, tx_pro: Sender<PromptPayload>, rx_ans: Receiver<String>) -> std::io::Result<()> {
         // make room for output + input line
         println!("");
 
@@ -144,10 +144,15 @@ impl TermTask {
                         self.refresh_userin();
                     },
                     event::KeyCode::Enter => {
-                        self.print_ln(format!("{} {}", Self::USERIN_PREFIX, self.userin_buf.as_str()))?;
-                        let _ = tx_pro.send(self.userin_buf.clone());
+                        let userin_saved = self.userin_buf.clone();
+                        let llmout_saved = self.llmout_buf.clone();
                         self.userin_buf.clear();
+                        self.llmout_buf.clear();
+                        last_wrap_idx = 0;
+                        self.print_ln(format!("{} {}", Self::USERIN_PREFIX, userin_saved))?;
                         self.refresh_userin();
+                        self.move_userin_down();
+                        let _ = tx_pro.send(PromptPayload {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
                     }
                     _ => () 
                 },

@@ -9,7 +9,7 @@ impl LlmModels {
     pub const GPT_O_4_Mini: &'static str = "o4-mini-2025-04-16";
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all="snake_case")]
 pub enum Role {Assistant, User, Developer}
 
@@ -28,25 +28,56 @@ pub struct Annotation {
     url_citation: UrlCitation,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct LlmMessage {
+#[derive(Deserialize)]
+pub struct LlmMessageRx {
     pub role: Option<Role>,
     pub content: Option<String>,
     pub refusal: Option<String>,
     pub annotations: Option<Vec<Annotation>>,
 }
 
-impl LlmMessage {
+impl LlmMessageRx {
+    pub fn is_refusal(&self) -> bool {
+        return self.refusal.is_some();
+    }
+
+    pub fn content_or_refusal(&self) -> Option<String> {
+       if let Some(_) = &self.refusal {
+            self.refusal.clone() 
+        } else if let Some(_) = &self.content {
+            self.content.clone()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct LlmMessageTx {
+    pub role: Role,
+    pub content: String,
+}
+
+impl LlmMessageTx {
     // Returns a vec of a single message intended for
     // an initial request. 
     pub fn new_user_request(content: String) -> Vec<Self> {
-        vec![LlmMessage {
-            role: Some(Role::User),
-            content: Some(content),
-            refusal: None,
-            annotations: None
+        vec![LlmMessageTx {
+            role: Role::User,
+            content,
         }]
     } 
+
+    pub fn from_history(content: &Vec<(Role, String)>) -> Vec<Self> {
+        content.iter()
+            .map(|(r, s)| {
+                LlmMessageTx {
+                    role: r.clone(),
+                    content: s.clone(),
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -63,7 +94,7 @@ pub struct Choice {
     pub index: usize,
     pub logprobs: Option<Logprobs>,
     #[serde(alias="delta")] // for streaming = true
-    pub message: LlmMessage,
+    pub message: LlmMessageRx,
 }
 
 /// Left empty for now out of laziness
@@ -98,7 +129,9 @@ impl ApiResponseTransmit for LlmResponse {
                 let data_parsed: LlmResponse = serde_json::from_str(json).unwrap();
 
                 if let Some(choice) = data_parsed.choices.get(0) {
-                    let _ = tx_ans.send(choice.message.content.clone().unwrap_or(String::from("")));
+                    if let Some(message) = choice.message.content_or_refusal() {
+                        let _ = tx_ans.send(message);
+                    }
                 }
 
                 event_data.clear();
@@ -112,7 +145,7 @@ impl ApiResponseTransmit for LlmResponse {
 #[derive(Serialize)]
 pub struct LlmRequest {
     pub model: &'static str,
-    pub messages: Vec<LlmMessage>,
+    pub messages: Vec<LlmMessageTx>,
     pub max_completion_tokens: u32,
     pub n: u32,
     pub stream: bool,

@@ -1,5 +1,5 @@
 [package]
-name = "hello-llm"
+name = "hello"
 version = "0.1.0"
 edition = "2021"
 
