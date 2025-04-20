@@ -64,21 +64,24 @@ impl TermTask {
         );
     }
 
-    fn move_userin_down(&mut self) {
+    fn move_userin_down(&mut self, userin_ui: bool) {
         let _ = execute!(self.stdout,
             style::Print("\n"), // < forces a one line scroll
             cursor::MoveToPreviousLine(1),
             terminal::Clear(terminal::ClearType::CurrentLine),
             cursor::MoveToNextLine(1),
-            style::Print(format!("{} {}", Self::USERIN_PREFIX, self.userin_buf)),
         );
+
+        if userin_ui {
+            let _ = execute!(self.stdout, style::Print(format!("{} {}", Self::USERIN_PREFIX, self.userin_buf)));
+        }
     }
 
     fn print_ln(&mut self, s: String) -> std::io::Result<()> {
         let tsize = terminal::size()?;
         let total_userin = Self::USERIN_PREFIX.len() + self.userin_buf.as_str().width() + 1;
         let inpnrow = (total_userin / (tsize.0 as usize) + 1) as u16;
-        self.move_userin_down(); 
+        self.move_userin_down(true); 
         let _ = execute!(self.stdout,
             cursor::SavePosition,
             cursor::MoveToPreviousLine(inpnrow),
@@ -88,19 +91,28 @@ impl TermTask {
         Ok(())
     }
 
-    pub fn run(mut self, tx_tty: Sender<TermTaskMessage>, rx_ans: Receiver<RequestTaskMessage>) -> std::io::Result<()> {
-        // make room for output + input line
-        println!("");
-
-        let _ = terminal::enable_raw_mode();
-
-        let mut last_wrap_idx: usize = 0;
-
+    fn prepare_userin_ui(&mut self) -> std::io::Result<()> {
         print!("{} ", Self::USERIN_PREFIX);
         self.stdout.flush()?;
+        Ok(())
+    }
 
+    pub fn run(mut self, tx_tty: Sender<TermTaskMessage>, rx_ans: Receiver<RequestTaskMessage>) -> std::io::Result<()> {
+        let with_userinput = !self.ctx.has_piped();
+
+        // make some room
+        println!("");
+        if with_userinput { self.prepare_userin_ui()?; }
+        terminal::enable_raw_mode()?;
+
+        let mut last_wrap_idx: usize = 0;
         let mut run_task = true;
+        let mut next_polling: Option<PollingMode> = None;
         while run_task {
+            if let Some(next_polling) = next_polling.take() {
+                self.polling_mode = next_polling;
+            }
+
             let tsize = terminal::size()?;
             let message: Option<RequestTaskMessage> = match self.polling_mode {
                 PollingMode::AwaitRequestUpdate => rx_ans.recv_timeout(Duration::from_millis(30)).map_or(None, |o| Some(o)),
@@ -111,8 +123,8 @@ impl TermTask {
             if let Some(message) = message {
                 match message {
                     RequestTaskMessage::Done => {
-                        self.polling_mode = PollingMode::AwaitUserin;
-                        if self.ctx.has_piped() {
+                        next_polling = Some(PollingMode::AwaitUserin);
+                        if !with_userinput {
                             let _ = tx_tty.send(TermTaskMessage::Die);
                             run_task = false;
                         }
@@ -126,7 +138,7 @@ impl TermTask {
                             self.llmout_buf.push(c);
                             match c {
                                 '\n' => {
-                                    self.move_userin_down();
+                                    self.move_userin_down(with_userinput);
                                 },
                                 _ => {
                                     let will_wrap = (curscol as usize) + c.width().unwrap_or(0) > tsize.0 as usize;
@@ -136,7 +148,7 @@ impl TermTask {
                                             .last()
                                             .unwrap_or((0,'\0')).0;
 
-                                        self.move_userin_down();
+                                        self.move_userin_down(with_userinput);
                                         curscol = 0;
                                     }
                                     let _ = queue!(self.stdout,
@@ -154,6 +166,8 @@ impl TermTask {
                     }
                 }
             }
+
+            if !with_userinput { continue; }
 
             let event = match self.polling_mode {
                 PollingMode::AwaitUserin => event::read()?,
@@ -192,11 +206,11 @@ impl TermTask {
                         self.userin_buf.clear();
                         self.llmout_buf.clear();
                         last_wrap_idx = 0;
-                        self.polling_mode = PollingMode::AwaitRequestUpdate;
+                        next_polling = Some(PollingMode::AwaitRequestUpdate);
 
                         self.print_ln(format!("{} {}", Self::USERIN_PREFIX, userin_saved))?;
                         self.refresh_userin();
-                        self.move_userin_down();
+                        self.move_userin_down(with_userinput);
 
                         let _ = tx_tty.send(TermTaskMessage::ReceivedUserPrompt {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
                     }
@@ -206,7 +220,7 @@ impl TermTask {
             }
         }
 
-        let _ = terminal::disable_raw_mode();
+        terminal::disable_raw_mode()?;
         Ok(())
     }
 }

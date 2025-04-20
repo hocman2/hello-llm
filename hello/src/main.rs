@@ -59,14 +59,18 @@ fn main() {
     let ctx = Context::new(prompt, piped);
 
     let (tx_ans, rx_ans) = channel();
-    let (tx_pro, rx_pro) = channel();
+    let (tx_tty, rx_tty) = channel();
     let req_thr_handle = thread::spawn({
         let ctx = ctx.clone();
         move || {
-            RequestTask::new(ctx).run(tx_ans, rx_pro);
+            RequestTask::new(ctx).run(tx_ans, rx_tty);
         }
     });
 
-    let _ = TermTask::new(ctx.clone()).run(tx_pro, rx_ans);
+    match TermTask::new(ctx.clone()).run(tx_tty, rx_ans) {
+        Err(e) => { println!("{e:?}"); },
+        Ok(()) => ()
+    };
+
     let _ = req_thr_handle.join();
 }

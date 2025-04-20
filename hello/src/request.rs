@@ -68,12 +68,21 @@ impl RequestTask {
     }
 
     pub fn run(mut self, tx_ans: Sender<RequestTaskMessage>, rx_tty: Receiver<TermTaskMessage>) {
+
+        let sysprompt_full: String = match self.ctx.get_piped_input() {
+            Some(piped) => {
+                let mut s = String::from(SYSPROMPT);
+                s.push_str(piped.as_str());
+                s
+            },
+            None => String::from(SYSPROMPT)
+        };
+
         let mut history: Vec<(Role, String)> = vec![
-            (Role::Developer, String::from(SYSPROMPT)),
+            (Role::Developer, sysprompt_full),
             (Role::User, self.ctx.get_initial_prompt())
         ];
 
-        // initial request pushed
         let request = LlmRequest {
             model: LlmModels::GPT_4_1_Mini,
             messages: LlmMessageTx::from_history(&history),
@@ -85,9 +94,13 @@ impl RequestTask {
         self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
         self.polling_mode = PollingMode::AwaitRequestUpdate;
 
-        // event loop
         let mut run_task = true;
+        let mut next_polling: Option<PollingMode> = None;
         while run_task {
+            if let Some(next_polling) = next_polling.take() {
+                self.polling_mode = next_polling;
+            }
+
             let tty_msg: Option<TermTaskMessage> = match self.polling_mode {
                 PollingMode::AwaitRequestUpdate => rx_tty.try_recv().map_or(None, |m| Some(m)),
                 PollingMode::AwaitPrompt => match rx_tty.recv() {
@@ -117,7 +130,7 @@ impl RequestTask {
 
                         let easy = self.build_easy_handle::<LlmResponse, LlmRequest>(request, tx_ans.clone());
                         self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
-                        self.polling_mode = PollingMode::AwaitRequestUpdate;
+                        next_polling = Some(PollingMode::AwaitRequestUpdate);
                     },
                     TermTaskMessage::Die => {
                         self.stop_ongoing();
@@ -133,7 +146,7 @@ impl RequestTask {
                     if running_handles == 0 && self.easy_handle.is_some() { 
                         self.stop_ongoing();
                         let _ = tx_ans.send(RequestTaskMessage::Done);
-                        self.polling_mode = PollingMode::AwaitPrompt;
+                        next_polling = Some(PollingMode::AwaitPrompt);
                     }
                 }
             }
