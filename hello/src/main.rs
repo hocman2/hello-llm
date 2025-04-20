@@ -1,13 +1,17 @@
 mod term;
 mod request;
 mod the_key;
+mod context;
 
 use std::env;
 use std::thread;
 use std::sync::mpsc::channel;
 use std::process::exit;
+use std::io::{stdin, Read};
+use std::os::fd::AsRawFd;
 use term::TermTask;
 use request::RequestTask;
+use context::Context;
 
 fn print_usage() {
     println!("Interact with an LLM. 
@@ -23,7 +27,24 @@ The equatorial radius is about 6,378 kilometers (3,963 miles), while the polar r
 ");
 }
 
+extern "C" {
+    fn isatty(fd: i32) -> i32;
+}
+
+fn is_tty<T: AsRawFd>(fd: &T) -> bool {
+    unsafe {isatty(fd.as_raw_fd()) != 0}
+}
+
 fn main() {
+    let mut stdin = stdin();
+    let piped = if !is_tty(&stdin) {
+        let mut buffer = String::new();
+        stdin.read_to_string(&mut buffer).unwrap();
+        Some(buffer)
+    } else {
+        None
+    };
+
     let argc = env::args().count() - 1;
     
     if argc == 0 {
@@ -35,11 +56,17 @@ fn main() {
         .skip(1)
         .fold(String::from("Hello,"), |mut acc, arg| { acc.push_str(format!(" {}", arg).as_str()); acc });
 
+    let ctx = Context::new(prompt, piped);
+
     let (tx_ans, rx_ans) = channel();
     let (tx_pro, rx_pro) = channel();
-    let _req_thr_handle = thread::spawn(move || {
-        RequestTask::new().run(tx_ans, rx_pro, prompt);
+    let req_thr_handle = thread::spawn({
+        let ctx = ctx.clone();
+        move || {
+            RequestTask::new(ctx).run(tx_ans, rx_pro);
+        }
     });
 
-    let _ = TermTask::new().run(tx_pro, rx_ans);
+    let _ = TermTask::new(ctx.clone()).run(tx_pro, rx_ans);
+    let _ = req_thr_handle.join();
 }

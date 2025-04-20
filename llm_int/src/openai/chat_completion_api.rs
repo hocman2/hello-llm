@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use crate::ApiResponseTransmit;
-use std::sync::mpsc::Sender;
 
 pub struct LlmModels {}
 #[allow(non_upper_case_globals)]
@@ -114,32 +113,34 @@ pub struct LlmResponse {
 }
 
 impl ApiResponseTransmit for LlmResponse {
-    fn transmit_response(data: &[u8], tx_ans: Sender<String>) -> Option<usize> {
+    fn transmit_response(data: &[u8]) -> (usize, String) {
         let data_str = std::str::from_utf8(&data).unwrap();
-        let mut event_data = String::new();
+        let mut json_data = String::new();
+        let mut piece = String::new();
         data_str.lines().for_each(|line| {
             if line.trim() == "data: [DONE]" {/* ignore end message */}
             else if line.starts_with("data:") {
                 // a whole json object might come in multiple data lines
                 let clean = line.strip_prefix("data:").unwrap_or(line).trim();
-                event_data.push_str(clean);
+                json_data.push_str(clean);
             } 
-            else if line.is_empty() && !event_data.is_empty() {
-                let json = event_data.trim();
-                let data_parsed: LlmResponse = serde_json::from_str(json).unwrap();
+            else if line.is_empty() && !json_data.is_empty() {
+                // lol that unwrap is dangerous
+                let data_parsed: LlmResponse = serde_json::from_str(json_data.trim()).unwrap();
 
                 if let Some(choice) = data_parsed.choices.get(0) {
                     if let Some(message) = choice.message.content_or_refusal() {
-                        let _ = tx_ans.send(message);
+                        // maybe there are multiple json messages in the data ? 
+                        piece.push_str(message.as_str());
                     }
                 }
 
-                event_data.clear();
+                json_data.clear();
             }
 
         });
 
-        Some(data.len())
+        (data.len(), piece)
     }
 }
 #[derive(Serialize)]

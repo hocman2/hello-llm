@@ -8,27 +8,45 @@ use serde::Serialize;
 use llm_int::ApiResponseTransmit;
 use llm_int::openai::chat_completion_api::{LlmRequest, LlmResponse, LlmMessageTx, LlmModels, Role};
 use crate::the_key::KEY;
-use predefined_prompts::{SYSPROMPT, GASLIGHTING};
+use crate::context::Context;
+use crate::term::TermTaskMessage;
+use predefined_prompts::SYSPROMPT;
 
-pub struct PromptPayload {
-    pub user_prompt: String,
-    pub llm_answer_prev: Option<String>
+pub enum RequestTaskMessage {
+    ReceivedPiece(String),
+    Done,
+}
+
+#[derive(PartialEq, Eq)]
+enum PollingMode {
+    AwaitRequestUpdate,
+    AwaitPrompt,
 }
 
 pub struct RequestTask {
     multi: Multi, 
-    easy_handle: Option<EasyHandle>
+    easy_handle: Option<EasyHandle>,
+    ctx: Context,
+    polling_mode: PollingMode,
 }
 
 impl RequestTask {
-    pub fn new() -> Self {
+    pub fn new(ctx: Context) -> Self {
         Self {
             multi: Multi::new(),
             easy_handle: None,
+            ctx,
+            polling_mode: PollingMode::AwaitPrompt,
         }
     }
 
-    fn build_easy_handle<Res: ApiResponseTransmit, Req: Serialize>(&self, request: Req, tx_ans: Sender<String>) -> Easy {
+    fn stop_ongoing(&mut self) {
+        if let Some(easy_handle) = self.easy_handle.take() {
+            let _ = self.multi.remove(easy_handle);
+        }
+    }
+
+    fn build_easy_handle<Res: ApiResponseTransmit, Req: Serialize>(&self, request: Req, tx_ans: Sender<RequestTaskMessage>) -> Easy {
         let mut easy = Easy::new();
         easy.url("https://api.openai.com/v1/chat/completions").unwrap();
         easy.post(true).unwrap();
@@ -41,62 +59,84 @@ impl RequestTask {
         let request = serde_json::to_string(&request).unwrap();
         easy.post_fields_copy(request.as_bytes()).unwrap();
         easy.write_function(move |data| { 
-            match Res::transmit_response(data, tx_ans.clone()) {
-                Some(sz) => Ok(sz),
-                None => Err(curl::easy::WriteError::Pause)
-            } 
+            let (sz, content) =  Res::transmit_response(data); 
+            let _ = tx_ans.send(RequestTaskMessage::ReceivedPiece(content));
+            Ok(sz)
         }).unwrap();
 
         easy
     }
 
-    pub fn run(mut self, tx_ans: Sender<String>, rx_pro: Receiver<PromptPayload>, prompt: String) {
-        let mut history: Vec<(Role, String)> = Vec::with_capacity(GASLIGHTING.len() + 2);
-        history.push((Role::Developer, String::from(SYSPROMPT)));
-        GASLIGHTING.iter().map(|(r, m)| (r.clone(), String::from(*m))).for_each(|g| history.push(g));
-        history.push((Role::User, prompt.clone()));
+    pub fn run(mut self, tx_ans: Sender<RequestTaskMessage>, rx_tty: Receiver<TermTaskMessage>) {
+        let mut history: Vec<(Role, String)> = vec![
+            (Role::Developer, String::from(SYSPROMPT)),
+            (Role::User, self.ctx.get_initial_prompt())
+        ];
 
+        // initial request pushed
         let request = LlmRequest {
             model: LlmModels::GPT_4_1_Mini,
-            messages: LlmMessageTx::new_user_request(prompt),
+            messages: LlmMessageTx::from_history(&history),
             max_completion_tokens: 4096,
             n: 1,
             stream: true,
         };
         let easy = self.build_easy_handle::<LlmResponse, LlmRequest>(request, tx_ans.clone());
         self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
-        loop {
-            let new_prompt = rx_pro.try_recv().map_or(None, |p| Some(p));
-            match new_prompt {
-                Some(PromptPayload {user_prompt, llm_answer_prev}) => {
-                    // stop the ongoing request, it doesn't matter anymore
-                    if let Some(easy_handle) = self.easy_handle {
-                        let _ = self.multi.remove(easy_handle);
-                        self.easy_handle = None;
+        self.polling_mode = PollingMode::AwaitRequestUpdate;
+
+        // event loop
+        let mut run_task = true;
+        while run_task {
+            let tty_msg: Option<TermTaskMessage> = match self.polling_mode {
+                PollingMode::AwaitRequestUpdate => rx_tty.try_recv().map_or(None, |m| Some(m)),
+                PollingMode::AwaitPrompt => match rx_tty.recv() {
+                    Ok(msg) => Some(msg),
+                    Err(_) => { self.stop_ongoing(); run_task = false; None } //tty task is closed
+                },
+            };
+
+            match tty_msg {
+                Some(tty_msg) => match tty_msg {
+                    TermTaskMessage::ReceivedUserPrompt {user_prompt, llm_answer_prev} => {
+                        self.stop_ongoing();
+
+                        if let Some(llm_answer_prev) = llm_answer_prev {
+                            history.push((Role::Assistant, llm_answer_prev));
+                        }
+
+                        history.push((Role::User, user_prompt));
+
+                        let request = LlmRequest {
+                            model: LlmModels::GPT_4_1_Mini,
+                            messages: LlmMessageTx::from_history(&history),
+                            max_completion_tokens: 4096,
+                            n: 1,
+                            stream: true,
+                        };
+
+                        let easy = self.build_easy_handle::<LlmResponse, LlmRequest>(request, tx_ans.clone());
+                        self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
+                        self.polling_mode = PollingMode::AwaitRequestUpdate;
+                    },
+                    TermTaskMessage::Die => {
+                        self.stop_ongoing();
+                        run_task = false;
                     }
-                    
-                    if let Some(llm_answer_prev) = llm_answer_prev {
-                        history.push((Role::Assistant, llm_answer_prev));
-                    }
-
-                    history.push((Role::User, user_prompt));
-
-                    let request = LlmRequest {
-                        model: LlmModels::GPT_4_1_Mini,
-                        messages: LlmMessageTx::from_history(&history),
-                        max_completion_tokens: 4096,
-                        n: 1,
-                        stream: true,
-                    };
-
-                    let easy = self.build_easy_handle::<LlmResponse, LlmRequest>(request, tx_ans.clone());
-                    self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
                 },
                 None => ()
             }
 
-            let _ = self.multi.wait(&mut [], Duration::from_millis(30));
-            let _ = self.multi.perform();
+            if self.polling_mode == PollingMode::AwaitRequestUpdate {
+                let _ = self.multi.wait(&mut [], Duration::from_millis(30));
+                if let Ok(running_handles) = self.multi.perform() {
+                    if running_handles == 0 && self.easy_handle.is_some() { 
+                        self.stop_ongoing();
+                        let _ = tx_ans.send(RequestTaskMessage::Done);
+                        self.polling_mode = PollingMode::AwaitPrompt;
+                    }
+                }
+            }
         }
     }
 

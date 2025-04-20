@@ -4,7 +4,8 @@ use std::time::Duration;
 use crossterm::{queue, execute, cursor, style, event, terminal};
 use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 use std::sync::mpsc::{Receiver, Sender};
-use crate::request::PromptPayload;
+use crate::request::RequestTaskMessage;
+use crate::context::Context;
 
 // helper founction
 fn last_line_width(buf: &str, last_wrap_idx: usize) -> usize {
@@ -20,20 +21,37 @@ fn last_line_width(buf: &str, last_wrap_idx: usize) -> usize {
     }
 }
 
+enum PollingMode {
+    AwaitUserin,
+    AwaitRequestUpdate,
+}
+
+pub enum TermTaskMessage {
+    ReceivedUserPrompt {
+        user_prompt: String,
+        llm_answer_prev: Option<String>
+    },
+    Die,
+}
+
 pub struct TermTask {
     userin_buf: String,
     llmout_buf: String,
     stdout: Stdout,
+    ctx: Context,
+    polling_mode: PollingMode,
 }
 
 impl TermTask {
     const USERIN_PREFIX: &'static str = ">";
 
-    pub fn new() -> Self {
+    pub fn new(ctx: Context) -> Self {
         Self {
             userin_buf: String::new(),
             llmout_buf: String::new(),
             stdout: stdout(),
+            ctx,
+            polling_mode: PollingMode::AwaitRequestUpdate,
         }
     }
 
@@ -70,7 +88,7 @@ impl TermTask {
         Ok(())
     }
 
-    pub fn run(mut self, tx_pro: Sender<PromptPayload>, rx_ans: Receiver<String>) -> std::io::Result<()> {
+    pub fn run(mut self, tx_tty: Sender<TermTaskMessage>, rx_ans: Receiver<RequestTaskMessage>) -> std::io::Result<()> {
         // make room for output + input line
         println!("");
 
@@ -81,54 +99,78 @@ impl TermTask {
         print!("{} ", Self::USERIN_PREFIX);
         self.stdout.flush()?;
 
-        loop {
+        let mut run_task = true;
+        while run_task {
             let tsize = terminal::size()?;
-            let piece: Option<String> = rx_ans.recv_timeout(Duration::from_millis(30)).map_or(None, |o| Some(o));
-            if let Some(piece) = piece {
-                let total_userin = Self::USERIN_PREFIX.len() + self.userin_buf.as_str().width() + 1;
-                let inpnrow = (total_userin / (tsize.0 as usize) + 1) as u16;
-                piece.chars().for_each(|c| {
+            let message: Option<RequestTaskMessage> = match self.polling_mode {
+                PollingMode::AwaitRequestUpdate => rx_ans.recv_timeout(Duration::from_millis(30)).map_or(None, |o| Some(o)),
+                // try_recv out of safety but we could just return None
+                PollingMode::AwaitUserin => rx_ans.try_recv().map_or(None, |o| Some(o)),
+            }; 
 
-                    let mut curscol = last_line_width(self.llmout_buf.as_str(), last_wrap_idx) as u16;
-                    self.llmout_buf.push(c);
-                    match c {
-                        '\n' => {
-                            self.move_userin_down();
-                        },
-                        _ => {
-                            let will_wrap = (curscol as usize) + c.width().unwrap_or(0) > tsize.0 as usize;
-                            if will_wrap {
-                                last_wrap_idx = self.llmout_buf
-                                    .char_indices()
-                                    .last()
-                                    .unwrap_or((0,'\0')).0;
-
-                                self.move_userin_down();
-                                curscol = 0;
-                            }
-                            let _ = queue!(self.stdout,
-                                cursor::SavePosition,
-                                cursor::MoveToPreviousLine(inpnrow),
-                                cursor::MoveToColumn(curscol),
-                                style::Print(c),
-                                cursor::RestorePosition,
-                            );
+            if let Some(message) = message {
+                match message {
+                    RequestTaskMessage::Done => {
+                        self.polling_mode = PollingMode::AwaitUserin;
+                        if self.ctx.has_piped() {
+                            let _ = tx_tty.send(TermTaskMessage::Die);
+                            run_task = false;
                         }
-                    }
-                });
+                    },
+                    RequestTaskMessage::ReceivedPiece(piece) => {
+                        let total_userin = Self::USERIN_PREFIX.len() + self.userin_buf.as_str().width() + 1;
+                        let inpnrow = (total_userin / (tsize.0 as usize) + 1) as u16;
+                        piece.chars().for_each(|c| {
 
-                let _ = self.stdout.flush();
+                            let mut curscol = last_line_width(self.llmout_buf.as_str(), last_wrap_idx) as u16;
+                            self.llmout_buf.push(c);
+                            match c {
+                                '\n' => {
+                                    self.move_userin_down();
+                                },
+                                _ => {
+                                    let will_wrap = (curscol as usize) + c.width().unwrap_or(0) > tsize.0 as usize;
+                                    if will_wrap {
+                                        last_wrap_idx = self.llmout_buf
+                                            .char_indices()
+                                            .last()
+                                            .unwrap_or((0,'\0')).0;
+
+                                        self.move_userin_down();
+                                        curscol = 0;
+                                    }
+                                    let _ = queue!(self.stdout,
+                                        cursor::SavePosition,
+                                        cursor::MoveToPreviousLine(inpnrow),
+                                        cursor::MoveToColumn(curscol),
+                                        style::Print(c),
+                                        cursor::RestorePosition,
+                                    );
+                                }
+                            }
+                        });
+
+                        let _ = self.stdout.flush();
+                    }
+                }
             }
 
-            if !event::poll(Duration::ZERO)? { continue; }
-            let event = event::read()?;
+            let event = match self.polling_mode {
+                PollingMode::AwaitUserin => event::read()?,
+                PollingMode::AwaitRequestUpdate => {
+                    if !event::poll(Duration::ZERO)? { continue; /* wish i had a goto ... */}
+                    event::read()?
+                }
+            };
 
             // leave with Enter OR CTRL-c
             if let event::Event::Key(ref event) = event {
                 if event.code == event::KeyCode::Enter && self.userin_buf.is_empty() {
+                    let _ = tx_tty.send(TermTaskMessage::Die);
                     break;
                 }
                 if event.code == event::KeyCode::Char('c') && event.modifiers == event::KeyModifiers::CONTROL {
+                    let _ = tx_tty.send(TermTaskMessage::Die);
                     break;
                 }
             }
@@ -146,13 +188,17 @@ impl TermTask {
                     event::KeyCode::Enter => {
                         let userin_saved = self.userin_buf.clone();
                         let llmout_saved = self.llmout_buf.clone();
+
                         self.userin_buf.clear();
                         self.llmout_buf.clear();
                         last_wrap_idx = 0;
+                        self.polling_mode = PollingMode::AwaitRequestUpdate;
+
                         self.print_ln(format!("{} {}", Self::USERIN_PREFIX, userin_saved))?;
                         self.refresh_userin();
                         self.move_userin_down();
-                        let _ = tx_pro.send(PromptPayload {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
+
+                        let _ = tx_tty.send(TermTaskMessage::ReceivedUserPrompt {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
                     }
                     _ => () 
                 },
