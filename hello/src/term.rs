@@ -130,7 +130,7 @@ impl TermTask {
                         }
                     },
                     RequestTaskMessage::ReceivedPiece(piece) => {
-                        let total_userin = Self::USERIN_PREFIX.len() + self.userin_buf.as_str().width() + 1;
+                        let total_userin = Self::USERIN_PREFIX.width() + self.userin_buf.as_str().width() + 1;
                         let inpnrow = (total_userin / (tsize.0 as usize) + 1) as u16;
                         piece.chars().for_each(|c| {
 
@@ -197,7 +197,40 @@ impl TermTask {
                     }
                     event::KeyCode::Backspace => {
                         self.userin_buf.pop();
-                        self.refresh_userin();
+                        
+                        let total_userin = Self::USERIN_PREFIX.width() + self.userin_buf.as_str().width() + 1;
+                        let numrows = ((total_userin / (tsize.0) as usize) + 1) as u16;
+                        if numrows == 1 {
+                            self.refresh_userin();
+                        } else {
+                            let mut line_start_byte = 0;
+                            let mut curr_width = Self::USERIN_PREFIX.width() + 1;
+                            for (i, c) in self.userin_buf.char_indices() {
+                                let w = c.width().unwrap_or(0);
+                                if curr_width + w > (tsize.0) as usize {
+                                    curr_width = w;
+                                    line_start_byte = i; 
+                                } else {
+                                    curr_width += w;
+                                }
+                            }
+
+                            if curr_width == tsize.0 as usize {
+                                let _ = execute!(
+                                    self.stdout,
+                                    terminal::Clear(terminal::ClearType::CurrentLine),
+                                    cursor::MoveToPreviousLine(1),
+                                    cursor::MoveToColumn(tsize.0)
+                                );
+                            } else {
+                                let _ = execute!(
+                                    self.stdout, 
+                                    cursor::MoveToColumn(0),
+                                    terminal::Clear(terminal::ClearType::CurrentLine),
+                                    style::Print(&self.userin_buf[line_start_byte..])
+                                );
+                            }
+                        }
                     },
                     event::KeyCode::Enter => {
                         let userin_saved = self.userin_buf.clone();
