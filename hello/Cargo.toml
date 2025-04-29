@@ -11,6 +11,8 @@ serde_json = "1.0.140"
 curl = "0.4.47"
 serde = { version = "1.0.219", features = ["derive"] }
 parking_lot = "0.12.3"
+getopts = "0.2.21"
+directories = "6.0.0"
 
 [profile.release]
 opt-level="z"

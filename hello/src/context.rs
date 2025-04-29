@@ -1,9 +1,11 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
+use crate::cli::{Config, Provider};
 
 struct SharedState {
     piped: Option<String>,
     initial_prompt: String,
+    config: Config,
 }
 
 #[derive(Clone)]
@@ -12,11 +14,12 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(initial_prompt: String, piped: Option<String>) -> Self {
+    pub fn new(initial_prompt: String, piped: Option<String>, config: Config) -> Self {
         Self {
             shared_state: Arc::new(Mutex::new(SharedState {
                 piped,
                 initial_prompt,
+                config,
             })),
         }
     }
@@ -31,5 +34,9 @@ impl Context {
 
     pub fn get_initial_prompt(&self) -> String {
         self.shared_state.lock().initial_prompt.clone()
+    }
+
+    pub fn get_key(&self, provider: Provider) -> Option<String> {
+        self.shared_state.lock().config.get_key(provider)
     }
 }

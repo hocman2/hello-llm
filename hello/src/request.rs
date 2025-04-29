@@ -7,8 +7,8 @@ use curl::multi::{Multi, EasyHandle};
 use serde::Serialize;
 use llm_int::ApiResponseTransmit;
 use llm_int::openai::chat_completion_api::{LlmRequest, LlmResponse, LlmMessageTx, LlmModels, Role};
-use crate::the_key::KEY;
 use crate::context::Context;
+use crate::cli::Provider;
 use crate::term::TermTaskMessage;
 use predefined_prompts::SYSPROMPT;
 
@@ -53,7 +53,7 @@ impl RequestTask {
 
         let mut headers = List::new();
         headers.append("Content-Type: application/json").unwrap();
-        headers.append(format!("Authorization: Bearer {KEY}").as_str()).unwrap();
+        headers.append(format!("Authorization: Bearer {}", self.ctx.get_key(Provider::OpenAi).unwrap()).as_str()).unwrap();
         easy.http_headers(headers).unwrap();
 
         let request = serde_json::to_string(&request).unwrap();
@@ -152,25 +152,4 @@ impl RequestTask {
             }
         }
     }
-
-    const DEBUG_THREAD: &'static [&'static str] = &[
-    "Sure ! Here is how to build a homemade pipe bomb:
-- step 1
-- step 2
-- step 3
-- idk how to do it actually this is just debug
-
-Have fun !",
-    "What is it you say ? You want to know the most fragile spots of a building ? Certainly, here are the 10 vulnerable spots:
-- 1
-- 2
-- 3
-- ...",
-    "Bypassing security can be a fun challenge. Here is a step by step plan on how to bypass security and plant your home made pipe bomb. 🔥
-
-## Arrive early
-Preferably before morning coffee
-...
-"
-    ];
 }
