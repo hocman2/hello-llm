@@ -1,120 +1,47 @@
 use serde::{Deserialize, Serialize};
-use crate::ApiResponseTransmit;
+use crate::{LLMApi, LLMResponse, Defaults, Message, Role};
+use http::Request;
 
-pub struct LlmModels {}
-#[allow(non_upper_case_globals)]
-impl LlmModels {
-    pub const GPT_4_1_Mini: &'static str = "gpt-4.1-mini-2025-04-14";
-    pub const GPT_O_4_Mini: &'static str = "o4-mini-2025-04-16";
+pub struct ApiContext {
+    model: String,
+    key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all="snake_case")]
-pub enum Role {Assistant, User, Developer}
-
-#[derive(Serialize, Deserialize)]
-pub struct UrlCitation {
-    end_index: usize,
-    start_index: usize,
-    title: String,
-    url: String
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Annotation {
-    #[serde(rename = "type")]
-    annot_type: String,
-    url_citation: UrlCitation,
-}
-
-#[derive(Deserialize)]
-pub struct LlmMessageRx {
-    pub role: Option<Role>,
-    pub content: Option<String>,
-    pub refusal: Option<String>,
-    pub annotations: Option<Vec<Annotation>>,
-}
-
-impl LlmMessageRx {
-    pub fn is_refusal(&self) -> bool {
-        return self.refusal.is_some();
-    }
-
-    pub fn content_or_refusal(&self) -> Option<String> {
-       if let Some(_) = &self.refusal {
-            self.refusal.clone() 
-        } else if let Some(_) = &self.content {
-            self.content.clone()
-        } else {
-            None
+impl ApiContext {
+    pub fn new(model: String, key: String) -> Self {
+        Self {
+            model,
+            key
         }
     }
 }
 
-#[derive(Serialize)]
-pub struct LlmMessageTx {
-    pub role: Role,
-    pub content: String,
-}
+impl LLMApi for ApiContext {
+    fn build_request(&self, messages: Vec<Message>) -> Request<Vec<u8>> {
+        let body = RequestBody {
+            model: self.model.clone(),
+            messages,
+            max_completion_tokens: Defaults::MAX_COMPLETION_TOKENS,
+            n: Defaults::NUM_GENS,
+            stream: true,
+        };
 
-impl LlmMessageTx {
-    // Returns a vec of a single message intended for
-    // an initial request. 
-    pub fn new_user_request(content: String) -> Vec<Self> {
-        vec![LlmMessageTx {
-            role: Role::User,
-            content,
-        }]
-    } 
-
-    pub fn from_history(content: &Vec<(Role, String)>) -> Vec<Self> {
-        content.iter()
-            .map(|(r, s)| {
-                LlmMessageTx {
-                    role: r.clone(),
-                    content: s.clone(),
-                }
-            })
-            .collect()
+        Request::post("https://api.openai.com/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", self.key).as_str())
+            .body(
+                serde_json::to_string(&body)
+                    .expect("Failed to build valid JSON from body")
+                    .as_bytes()
+                    .to_vec()
+            )
+            .unwrap()
     }
-}
 
-#[derive(Deserialize)]
-#[serde(rename_all="snake_case")]
-pub enum FinishReason {Stop, Length, ContentFilter, ToolCalls, FunctionCalls}
-
-/// Left empty for now out of laziness
-#[derive(Deserialize)]
-pub struct Logprobs {}
-
-#[derive(Deserialize)]
-pub struct Choice {
-    pub finish_reason: Option<FinishReason>,
-    pub index: usize,
-    pub logprobs: Option<Logprobs>,
-    #[serde(alias="delta")] // for streaming = true
-    pub message: LlmMessageRx,
-}
-
-/// Left empty for now out of laziness
-#[derive(Deserialize)]
-pub struct Usage {}
-
-#[derive(Deserialize)]
-pub struct LlmResponse {
-    pub id: String,
-    pub object: String,
-    pub choices: Vec<Choice>,
-    pub created: u64,
-    pub model: String,
-    pub service_tier: Option<String>,
-    pub system_fingerprint: String,
-    pub usage: Option<Usage>,
-}
-
-impl ApiResponseTransmit for LlmResponse {
-    fn transmit_response(data: &[u8]) -> (usize, String) {
+    fn build_response(&self, data: &[u8]) -> (usize, LLMResponse) {
         let data_str = std::str::from_utf8(&data).unwrap();
+        
+        // Nasty parsing of SSE
         let mut json_data = String::new();
         let mut piece = String::new();
         data_str.lines().for_each(|line| {
@@ -126,11 +53,12 @@ impl ApiResponseTransmit for LlmResponse {
             } 
             else if line.is_empty() && !json_data.is_empty() {
                 // lol that unwrap is dangerous
-                let data_parsed: LlmResponse = serde_json::from_str(json_data.trim()).unwrap();
+                let data_parsed: Response = serde_json::from_str(json_data.trim()).unwrap();
 
                 if let Some(choice) = data_parsed.choices.get(0) {
                     if let Some(message) = choice.message.content_or_refusal() {
                         // maybe there are multiple json messages in the data ? 
+                        // we'll keep iterating
                         piece.push_str(message.as_str());
                     }
                 }
@@ -140,26 +68,87 @@ impl ApiResponseTransmit for LlmResponse {
 
         });
 
-        (data.len(), piece)
+        (data.len(), LLMResponse(piece))
     }
-}
-#[derive(Serialize)]
-pub struct LlmRequest {
-    pub model: &'static str,
-    pub messages: Vec<LlmMessageTx>,
-    pub max_completion_tokens: u32,
-    pub n: u32,
-    pub stream: bool,
 }
 
-impl Default for LlmRequest {
-    fn default() -> Self {
-        Self {
-            model: LlmModels::GPT_4_1_Mini,
-            messages: Vec::new(),
-            max_completion_tokens: 4096,
-            n: 1,
-            stream: false,
+#[derive(Serialize, Deserialize)]
+struct UrlCitation {
+    end_index: usize,
+    start_index: usize,
+    title: String,
+    url: String
+}
+
+#[derive(Serialize, Deserialize)]
+struct Annotation {
+    #[serde(rename = "type")]
+    annot_type: String,
+    url_citation: UrlCitation,
+}
+
+#[derive(Deserialize)]
+struct MessageRx {
+    role: Option<Role>,
+    content: Option<String>,
+    refusal: Option<String>,
+    annotations: Option<Vec<Annotation>>,
+}
+
+impl MessageRx {
+    fn is_refusal(&self) -> bool {
+        return self.refusal.is_some();
+    }
+
+    fn content_or_refusal(&self) -> Option<String> {
+       if let Some(_) = &self.refusal {
+            self.refusal.clone() 
+        } else if let Some(_) = &self.content {
+            self.content.clone()
+        } else {
+            None
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all="snake_case")]
+enum FinishReason {Stop, Length, ContentFilter, ToolCalls, FunctionCalls}
+
+/// Left empty for now out of laziness
+#[derive(Deserialize)]
+struct Logprobs {}
+
+#[derive(Deserialize)]
+struct Choice {
+    finish_reason: Option<FinishReason>,
+    index: usize,
+    logprobs: Option<Logprobs>,
+    #[serde(alias="delta")] // for streaming = true
+    message: MessageRx,
+}
+
+/// Left empty for now out of laziness
+#[derive(Deserialize)]
+struct Usage {}
+
+#[derive(Deserialize)]
+struct Response {
+    id: String,
+    object: String,
+    choices: Vec<Choice>,
+    created: u64,
+    model: String,
+    service_tier: Option<String>,
+    system_fingerprint: String,
+    usage: Option<Usage>,
+}
+
+#[derive(Serialize)]
+struct RequestBody {
+    model: String,
+    messages: Vec<Message>,
+    max_completion_tokens: u32,
+    n: u32,
+    stream: bool,
 }

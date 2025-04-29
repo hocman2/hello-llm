@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 use std::path::Path;
 use std::fs::File;
 use std::io::{Read, Write};
+use llm_int::Provider;
 
 #[derive(Debug)]
 pub enum Error {
@@ -14,11 +15,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Serialize, Deserialize, Hash, Eq, PartialEq)]
-pub enum Provider {
-    OpenAi
-}
 
 pub enum Verb {
     Get,
@@ -57,12 +53,14 @@ impl FromStr for What {
     }
 }
 
-impl FromStr for Provider {
+// this is the dumbest shit ive done today
+struct ProviderExt(pub Provider);
+impl FromStr for ProviderExt {
     type Err = Error;
 
-    fn from_str(s: &str) -> std::result::Result<Provider, Self::Err> {
+    fn from_str(s: &str) -> std::result::Result<ProviderExt, Self::Err> {
         match s {
-            "openai" => Ok(Provider::OpenAi),
+            "openai" => Ok(ProviderExt(Provider::OpenAi)),
             _ => Err(Error::ArgParse),
         }
     }
@@ -108,8 +106,8 @@ pub fn get_config_action(args: &[String]) -> Result<(Verb, What, Provider)> {
             return Err(Error::ReadConfigAction(String::from("Error: unrecognized what argument")));
         }
     };
-    let who = match Provider::from_str(args[2].as_str()) {
-        Ok(w) => w,
+    let who = match ProviderExt::from_str(args[2].as_str()) {
+        Ok(ProviderExt(w)) => w,
         Err(_) => {
             return Err(Error::ReadConfigAction(String::from("Error: unrecognized who argument")));
         }

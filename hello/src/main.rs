@@ -14,6 +14,7 @@ use std::os::fd::AsRawFd;
 use term::TermTask;
 use request::RequestTask;
 use context::Context;
+use llm_int::{LLMContext, Provider, openai};
 use directories::ProjectDirs;
 
 const CONFIG_FILE_NAME: &'static str = ".config.json";
@@ -110,7 +111,16 @@ fn main() {
             .skip(1)
             .fold(String::from("Hello,"), |mut acc, arg| { acc.push_str(" "); acc.push_str(arg); acc });
 
-        let ctx = Context::new(prompt, piped, config);
+        let api_key = match config.get_key(Provider::OpenAi) {
+            Some(k) => k,
+            None => {
+                eprintln!("Error: missing api key.");
+                cli::print_usage(false);
+                exit(2);
+            }
+        };
+        let llm_ctx = LLMContext::new(Provider::OpenAi, openai::Models::GPT_4_1_Mini.to_string(), api_key);
+        let ctx = Context::new(prompt, piped, config, llm_ctx);
 
         let (tx_ans, rx_ans) = channel();
         let (tx_tty, rx_tty) = channel();

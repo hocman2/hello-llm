@@ -4,11 +4,8 @@ use std::sync::mpsc::{Sender, Receiver};
 use std::time::Duration;
 use curl::easy::{Easy, List};
 use curl::multi::{Multi, EasyHandle};
-use serde::Serialize;
-use llm_int::ApiResponseTransmit;
-use llm_int::openai::chat_completion_api::{LlmRequest, LlmResponse, LlmMessageTx, LlmModels, Role};
+use llm_int::{LLMContext, LLMApi, Message, Role};
 use crate::context::Context;
-use crate::cli::Provider;
 use crate::term::TermTaskMessage;
 use predefined_prompts::SYSPROMPT;
 
@@ -46,21 +43,24 @@ impl RequestTask {
         }
     }
 
-    fn build_easy_handle<Res: ApiResponseTransmit, Req: Serialize>(&self, request: Req, tx_ans: Sender<RequestTaskMessage>) -> Easy {
-        let mut easy = Easy::new();
-        easy.url("https://api.openai.com/v1/chat/completions").unwrap();
-        easy.post(true).unwrap();
+    fn build_easy_handle(&self, llm_ctx: LLMContext, messages: Vec<Message>, tx_ans: Sender<RequestTaskMessage>) -> Easy {
+        let req = llm_ctx.build_request(messages);
 
-        let mut headers = List::new();
-        headers.append("Content-Type: application/json").unwrap();
-        headers.append(format!("Authorization: Bearer {}", self.ctx.get_key(Provider::OpenAi).unwrap()).as_str()).unwrap();
+        let mut easy = Easy::new();
+        easy.url(&req.uri().to_string()).unwrap();
+        let headers = req.headers()
+            .iter()
+            .fold(List::new(), |mut list, (hn, hv)| { let _ = list.append(format!("{hn}: {}", hv.to_str().unwrap()).as_str()); list });
         easy.http_headers(headers).unwrap();
 
-        let request = serde_json::to_string(&request).unwrap();
-        easy.post_fields_copy(request.as_bytes()).unwrap();
+        if req.method() == http::Method::POST {
+            easy.post(true).unwrap();
+            easy.post_fields_copy(req.into_body().as_slice()).unwrap();
+        }
+
         easy.write_function(move |data| { 
-            let (sz, content) =  Res::transmit_response(data); 
-            let _ = tx_ans.send(RequestTaskMessage::ReceivedPiece(content));
+            let (sz, content) = llm_ctx.build_response(data);
+            let _ = tx_ans.send(RequestTaskMessage::ReceivedPiece(content.0));
             Ok(sz)
         }).unwrap();
 
@@ -83,14 +83,8 @@ impl RequestTask {
             (Role::User, self.ctx.get_initial_prompt())
         ];
 
-        let request = LlmRequest {
-            model: LlmModels::GPT_4_1_Mini,
-            messages: LlmMessageTx::from_history(&history),
-            max_completion_tokens: 4096,
-            n: 1,
-            stream: true,
-        };
-        let easy = self.build_easy_handle::<LlmResponse, LlmRequest>(request, tx_ans.clone());
+        let messages = Message::from_history(&history);
+        let easy = self.build_easy_handle(self.ctx.get_llm(), messages, tx_ans.clone());
         self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
         self.polling_mode = PollingMode::AwaitRequestUpdate;
 
@@ -120,15 +114,8 @@ impl RequestTask {
 
                         history.push((Role::User, user_prompt));
 
-                        let request = LlmRequest {
-                            model: LlmModels::GPT_4_1_Mini,
-                            messages: LlmMessageTx::from_history(&history),
-                            max_completion_tokens: 4096,
-                            n: 1,
-                            stream: true,
-                        };
-
-                        let easy = self.build_easy_handle::<LlmResponse, LlmRequest>(request, tx_ans.clone());
+                        let messages = Message::from_history(&history);
+                        let easy = self.build_easy_handle(self.ctx.get_llm(), messages, tx_ans.clone());
                         self.easy_handle = self.multi.add(easy).map_or(None, |h| Some(h));
                         next_polling = Some(PollingMode::AwaitRequestUpdate);
                     },

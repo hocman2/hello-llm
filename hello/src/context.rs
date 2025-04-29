@@ -1,11 +1,13 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
-use crate::cli::{Config, Provider};
+use crate::cli::Config;
+use llm_int::LLMContext;
 
 struct SharedState {
     piped: Option<String>,
     initial_prompt: String,
     config: Config,
+    llm_ctx: LLMContext,
 }
 
 #[derive(Clone)]
@@ -14,12 +16,13 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(initial_prompt: String, piped: Option<String>, config: Config) -> Self {
+    pub fn new(initial_prompt: String, piped: Option<String>, config: Config, llm_ctx: LLMContext) -> Self {
         Self {
             shared_state: Arc::new(Mutex::new(SharedState {
                 piped,
                 initial_prompt,
                 config,
+                llm_ctx
             })),
         }
     }
@@ -36,7 +39,7 @@ impl Context {
         self.shared_state.lock().initial_prompt.clone()
     }
 
-    pub fn get_key(&self, provider: Provider) -> Option<String> {
-        self.shared_state.lock().config.get_key(provider)
+    pub fn get_llm(&self) -> LLMContext {
+        self.shared_state.lock().llm_ctx.clone()
     }
 }
