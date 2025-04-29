@@ -26,7 +26,7 @@ fn is_tty<T: AsRawFd>(fd: &T) -> bool {
     unsafe {isatty(fd.as_raw_fd()) != 0}
 }
 
-fn open_config() -> (PathBuf,Config) {
+fn open_config() -> (PathBuf, cli::Config) {
     let data_dir: PathBuf = match ProjectDirs::from("", "", "hello-llm") {
         Some(project_dir) => {
             project_dir.data_dir().to_owned()
