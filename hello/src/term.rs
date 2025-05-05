@@ -2,6 +2,7 @@
 use std::io::{stdout, Stdout, Write};
 use std::time::Duration;
 use crossterm::{queue, execute, cursor, style, event, terminal};
+use crossterm::event::{PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags, KeyboardEnhancementFlags};
 use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 use std::sync::mpsc::{Receiver, Sender};
 use crate::request::RequestTaskMessage;
@@ -75,6 +76,24 @@ impl TermTask {
         let _ = execute!(self.stdout, style::Print(format!("{} {}", Self::USERIN_PREFIX, self.userin_buf)));
     }
 
+    fn count_userin_lines(&self) (u32, usize) {
+        let mut last_ln_width = 0;
+        let numrows = self.userin_buf.lines().fold(0, |mut rows, line| {
+            last_ln_width = if rows == 0 {
+                const SPACE_WIDTH: usize = 1;
+                Self::USERIN_PREFIX.width() + SPACE_WIDTH + line.width()
+            } else {
+                    line.width()
+                }; 
+
+            rows += 1 + (last_ln_width / (tsize.0 as usize)) as u16;
+            last_ln_width %= tsize.0 as usize;
+            rows
+        });
+
+        (numrows, last_ln_width)
+    }
+
     fn print_ln(&mut self, s: String) -> std::io::Result<()> {
         let tsize = terminal::size()?;
         let total_userin = Self::USERIN_PREFIX.len() + self.userin_buf.as_str().width() + 1;
@@ -100,6 +119,22 @@ impl TermTask {
         println!("");
         self.prepare_userin_ui()?;
         terminal::enable_raw_mode()?;
+
+        let supports_keyboard_enhancement = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true));
+
+        if supports_keyboard_enhancement {
+            execute!(
+                self.stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+        }
 
         let mut last_wrap_idx: usize = 0;
         let run_task = true;
@@ -169,7 +204,11 @@ impl TermTask {
 
             // leave with Enter OR CTRL-c
             if let event::Event::Key(ref event) = event {
-                if event.code == event::KeyCode::Enter && self.userin_buf.is_empty() {
+                if 
+                event.kind == event::KeyEventKind::Pressed && 
+                event.code == event::KeyCode::Enter && 
+                event.modifiers == event::KeyModifiers::NONE && 
+                self.userin_buf.is_empty() {
                     let _ = tx_tty.send(TermTaskMessage::Die);
                     break;
                 }
@@ -180,37 +219,64 @@ impl TermTask {
             }
 
             match event {
-                event::Event::Key(event) => match event.code {
+                event::Event::Key(evt) if evt.kind != event::KeyEventKind::Release => match evt.code {
                     event::KeyCode::Char(c) => {
                         self.userin_buf.push(c);
                         let _ = execute!(self.stdout, style::Print(c));
                     }
-                    event::KeyCode::Backspace => {
-                        self.userin_buf.pop();
-                        
-                        let total_userin = Self::USERIN_PREFIX.width() + self.userin_buf.as_str().width() + 1;
-                        let numrows = ((total_userin / (tsize.0) as usize) + 1) as u16;
-                        if numrows == 1 {
-                            self.refresh_userin();
+                    event::KeyCode::Backspace => 'handle_backspace: {
+                        let popped = self.userin_buf.pop().unwrap_or('\0');
+
+                        let (numrows, last_ln_width) = self.count_userin_lines();
+
+                        if popped == '\n' {
+                            let _ = execute!(
+                                self.stdout,
+                                terminal::Clear(terminal::ClearType::CurrentLine),
+                                cursor::MoveToPreviousLine(1),
+                                cursor::MoveToColumn(last_ln_width as u16)
+                            );
+
+                            break 'handle_backspace;
+                        } 
+
+                        if numrows <= 1 {
+                            if let Some('\n') = self.userin_buf.chars().last() {
+                                self.userin_buf.pop();
+                                let _ = execute!(
+                                    self.stdout,
+                                    terminal::Clear(terminal::ClearType::CurrentLine),
+                                    cursor::MoveToPreviousLine(1),
+                                    cursor::MoveToColumn((self.userin_buf.as_str().width() + 2) as u16)
+                                );
+                            } else {
+                                self.refresh_userin();
+                            }
                         } else {
                             let mut line_start_byte = 0;
+                            let mut pv_char: char = '\0';
                             let mut curr_width = Self::USERIN_PREFIX.width() + 1;
                             for (i, c) in self.userin_buf.char_indices() {
                                 let w = c.width().unwrap_or(0);
-                                if curr_width + w > (tsize.0) as usize {
+                                if pv_char == '\n' || curr_width + w > (tsize.0) as usize {
                                     curr_width = w;
                                     line_start_byte = i; 
                                 } else {
                                     curr_width += w;
                                 }
+                                pv_char = c;
                             }
 
-                            if curr_width == tsize.0 as usize {
+                            if curr_width == tsize.0 as usize || pv_char == '\n' {
+                                if pv_char == '\n' {
+                                    self.userin_buf.pop();
+                                }
+
                                 let _ = execute!(
                                     self.stdout,
                                     terminal::Clear(terminal::ClearType::CurrentLine),
                                     cursor::MoveToPreviousLine(1),
-                                    cursor::MoveToColumn(tsize.0)
+                                    cursor::MoveToColumn(curr_width as u16)
                                 );
                             } else {
                                 let _ = execute!(
@@ -223,24 +289,33 @@ impl TermTask {
                         }
                     },
                     event::KeyCode::Enter => {
-                        let userin_saved = self.userin_buf.clone();
-                        let llmout_saved = self.llmout_buf.clone();
+                        if evt.modifiers == event::KeyModifiers::SHIFT {
+                            self.userin_buf.push('\n');
+                            let _ = execute!(self.stdout, style::Print('\n'), cursor::MoveToColumn(0));
+                        } else {
+                            let userin_saved = self.userin_buf.clone();
+                            let llmout_saved = self.llmout_buf.clone();
 
-                        self.userin_buf.clear();
-                        self.llmout_buf.clear();
-                        last_wrap_idx = 0;
-                        next_polling = Some(PollingMode::AwaitRequestUpdate);
+                            self.userin_buf.clear();
+                            self.llmout_buf.clear();
+                            last_wrap_idx = 0;
+                            next_polling = Some(PollingMode::AwaitRequestUpdate);
 
-                        self.print_ln(format!("{} {}", Self::USERIN_PREFIX, userin_saved))?;
-                        self.refresh_userin();
-                        self.move_userin_down();
+                            self.print_ln(format!("{} {}", Self::USERIN_PREFIX, userin_saved))?;
+                            self.refresh_userin();
+                            self.move_userin_down();
 
-                        let _ = tx_tty.send(TermTaskMessage::ReceivedUserPrompt {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
+                            let _ = tx_tty.send(TermTaskMessage::ReceivedUserPrompt {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
+                        }
                     }
                     _ => () 
                 },
                 _ => ()
             }
+        }
+
+        if supports_keyboard_enhancement {
+            execute!(self.stdout, PopKeyboardEnhancementFlags)?;
         }
 
         terminal::disable_raw_mode()?;
