@@ -1,5 +1,7 @@
 mod output_metadata_gen;
+mod str_ext;
 
+use str_ext::StrExt;
 use std::io::{stdout, Stdout, Write};
 use std::time::Duration;
 use crossterm::{queue, execute, cursor, style, event, terminal};
@@ -9,20 +11,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use crate::context::Context;
 use crate::request::RequestTaskMessage;
 use output_metadata_gen::OutputMetadata;
-
-// helper founction
-fn last_line_width(buf: &str, last_wrap_idx: usize) -> usize {
-    if buf.len() == 0 || buf.ends_with('\n') {
-        return 0;
-    }
-
-    let split_buf = buf.split_at(last_wrap_idx).1;
-    if let Some(idx) = split_buf.rfind('\n') {
-        return split_buf.split_at(idx).1.trim_matches('\n').width();    
-    } else {
-        return split_buf.width();
-    }
-}
 
 enum PollingMode {
     AwaitUserin,
@@ -54,43 +42,39 @@ impl UserIn {
             stdout: stdout(),
         }
     }
-    
+
     fn refresh(&mut self) {
         let _ = execute!(
-            self.stdout, 
+            self.stdout,
             terminal::Clear(terminal::ClearType::CurrentLine),
             cursor::MoveToColumn(0),
             style::Print(format!("{} {}", Self::PREFIX, self.buf.as_str()))
         );
     }
 
-    fn move_down(&mut self, n: u16) {
-        let _ = execute!(self.stdout,
-            style::Print("\n"), // < forces a one line scroll
-            cursor::MoveToPreviousLine(n),
-            terminal::Clear(terminal::ClearType::CurrentLine),
-            cursor::MoveToNextLine(n),
-        );
+    fn clear(&mut self) -> std::io::Result<()> {
+        execute!(self.stdout,
+           terminal::Clear(terminal::ClearType::FromCursorDown),
+       )?;
 
-        let _ = execute!(self.stdout, style::Print(format!("{} {}", Self::PREFIX, self.buf)));
+       Ok(())
     }
+
+    //fn move_down(&mut self, n: u16) {
+    //    let _ = execute!(self.stdout,
+    //        style::Print("\n"), // < forces a one line scroll
+    //        cursor::MoveToPreviousLine(n),
+    //        terminal::Clear(terminal::ClearType::CurrentLine),
+    //        cursor::MoveToNextLine(n),
+    //    );
+
+    //    let _ = execute!(self.stdout, style::Print(format!("{} {}", Self::PREFIX, self.buf)));
+    //}
 
     // actively recounts userin lines, use this if userin buffer has been modified, otherwise used
     // cached get_lines_info
     fn count_lines(&mut self, tsize: (u16, u16)) -> LinesInfo {
-        let mut last_ln_width = 0;
-        let mut numrows = self.buf.lines().fold(0, |mut rows, line| {
-            last_ln_width = if rows == 0 {
-                const SPACE_WIDTH: usize = 1;
-                Self::PREFIX.width() + SPACE_WIDTH + line.width()
-            } else {
-                    line.width()
-                }; 
-
-            rows += 1 + (last_ln_width / (tsize.0 as usize)) as u16;
-            last_ln_width %= tsize.0 as usize;
-            rows
-        });
+        let (mut numrows, last_ln_width) = format!("{} {}", Self::PREFIX, self.buf).wrapped_width(tsize.0);
 
         // might happen if the buffer is empty, lines would be an empty iterator
         if numrows == 0 { numrows = 1; }
@@ -126,7 +110,7 @@ impl UserIn {
             );
 
             return;
-        } 
+        }
 
         if numlines <= 1 {
             if let Some('\n') = self.buf.chars().last() {
@@ -149,7 +133,7 @@ impl UserIn {
                 let w = c.width().unwrap_or(0);
                 if pv_char == '\n' || curr_width + w > (tsize.0) as usize {
                     curr_width = w;
-                    line_start_byte = i; 
+                    line_start_byte = i;
                 } else {
                     curr_width += w;
                 }
@@ -170,7 +154,7 @@ impl UserIn {
                 );
             } else {
                 let _ = execute!(
-                    self.stdout, 
+                    self.stdout,
                     cursor::MoveToColumn(0),
                     terminal::Clear(terminal::ClearType::CurrentLine),
                     style::Print(&self.buf[line_start_byte..])
@@ -191,7 +175,6 @@ pub enum TermTaskMessage {
 pub struct TermTask {
     userin: UserIn,
     llmout_buf: String,
-    llmout_numln: u32,
     stdout: Stdout,
     ctx: Context,
     polling_mode: PollingMode,
@@ -203,7 +186,6 @@ impl TermTask {
         Self {
             userin: UserIn::new(),
             llmout_buf: String::new(),
-            llmout_numln: 1,
             stdout: stdout(),
             ctx,
             polling_mode: PollingMode::AwaitRequestUpdate,
@@ -211,20 +193,36 @@ impl TermTask {
         }
     }
 
-    fn print_ln(&mut self, s: String) -> std::io::Result<()> {
-        let tsize = terminal::size()?;
-        let LinesInfo {numlines, ..} = self.userin.get_lines_info();
-        let strwidth = s.as_str().width();
-        let strnrow = (strwidth / (tsize.0 as usize) + 1) as u16;
-        self.userin.move_down(strnrow); 
-        execute!(self.stdout,
-            cursor::SavePosition,
-            cursor::MoveToPreviousLine(numlines as u16),
-            style::Print(format!("{s}\n")),
-            cursor::RestorePosition,
-        )?;
+    // Writes a piece on screen at position with proper wrapping and cursor movement
+    pub fn print(&mut self, s: &str, col: u16, row: u16) -> std::io::Result<()> {
+        let _ = queue!(self.stdout, cursor::MoveTo(col, row));
+
+        for c in s.chars() {
+            queue!(self.stdout, style::Print(c))?;
+            match c {
+                '\n' => { queue!(self.stdout, cursor::MoveToColumn(0))?; },
+                _ => {}
+            }
+        }
+
+        self.stdout.flush()?;
         Ok(())
     }
+
+    //fn print_ln(&mut self, s: String) -> std::io::Result<()> {
+    //    let tsize = terminal::size()?;
+    //    let LinesInfo {numlines, ..} = self.userin.get_lines_info();
+    //    let strwidth = s.as_str().width();
+    //    let strnrow = (strwidth / (tsize.0 as usize) + 1) as u16;
+    //    self.userin.move_down(strnrow);
+    //    execute!(self.stdout,
+    //        cursor::SavePosition,
+    //        cursor::MoveToPreviousLine(numlines as u16),
+    //        style::Print(format!("{s}\n")),
+    //        cursor::RestorePosition,
+    //    )?;
+    //    Ok(())
+    //}
 
     fn output_idx_to_term_pos(&self, tsize: (u16, u16), output_str_idx: usize) -> (u16, u16) {
         let mut idx_row = 0;
@@ -232,7 +230,7 @@ impl TermTask {
         self.llmout_buf.char_indices().for_each(|(i, c)| {
             if i >= output_str_idx { return; }
             match c {
-                '\n' => { 
+                '\n' => {
                     idx_row += 1;
                     idx_col = 0;
                 },
@@ -273,7 +271,6 @@ impl TermTask {
             )?;
         }
 
-        let mut last_wrap_idx: usize = 0;
         let run_task = true;
         let mut next_polling: Option<PollingMode> = None;
         while run_task {
@@ -286,7 +283,7 @@ impl TermTask {
                 PollingMode::AwaitRequestUpdate => rx_ans.recv_timeout(Duration::from_millis(30)).map_or(None, |o| Some(o)),
                 // try_recv out of safety but we could just return None
                 PollingMode::AwaitUserin => rx_ans.try_recv().map_or(None, |o| Some(o)),
-            }; 
+            };
 
             if let Some(message) = message {
                 match message {
@@ -296,26 +293,30 @@ impl TermTask {
                             Some((start, end)) => {
                                 let (start_row, start_col) = self.output_idx_to_term_pos(tsize, start);
                                 let LinesInfo {numlines: userin_ln, ..} = self.userin.get_lines_info();
+                                let (out_ln, _) = self.llmout_buf.wrapped_width(tsize.0);
 
                                 let t_height = tsize.1 as i32;
-                                let block_height = (userin_ln + self.llmout_numln) as i32;
+                                let block_height = (userin_ln + out_ln) as i32;
                                 let start_row_rel = (t_height - block_height + start_row as i32).clamp(0, u16::MAX.into()) as u16;
 
                                 let mut longest_ln_width = 0;
-                                for ln in self.llmout_buf[start..end].lines() {
+                                let lines: Vec<&str> = self.llmout_buf[start..end].lines().collect();
+                                let last_widths: Vec<usize> = lines.iter().map(|ln| {
                                     let w = ln.width();
-                                    if w > longest_ln_width { longest_ln_width = w; }
-                                }
+                                    let clamped = w.clamp(0, tsize.0 as usize);
+                                    if clamped > longest_ln_width { longest_ln_width = clamped; }
+                                    w % tsize.0 as usize
+                                }).collect();
 
                                 let mut content_style = style::ContentStyle::new();
                                 content_style.background_color = Some(style::Color::Black);
                                 content_style.foreground_color = Some(style::Color::White);
 
                                 queue!(self.stdout, cursor::SavePosition, cursor::MoveTo(start_col, start_row_rel))?;
-                                for ln in self.llmout_buf[start..end].lines() {
-                                    queue!(self.stdout, 
-                                        style::PrintStyledContent(content_style.apply(ln)), 
-                                        style::PrintStyledContent(content_style.apply(" ".repeat(longest_ln_width - ln.width()))),
+                                for (ln, w) in lines.iter().zip(last_widths.iter()) {
+                                    queue!(self.stdout,
+                                        style::PrintStyledContent(content_style.apply(ln)),
+                                        style::PrintStyledContent(content_style.apply(" ".repeat(longest_ln_width - w))),
                                         style::Print("\n"),
                                         cursor::MoveToColumn(0)
                                     )?;
@@ -328,40 +329,13 @@ impl TermTask {
                         next_polling = Some(PollingMode::AwaitUserin);
                     },
                     RequestTaskMessage::ReceivedPiece(piece) => {
-                        let LinesInfo {numlines, ..} = self.userin.get_lines_info();
-                        piece.chars().for_each(|c| {
-                            let mut curscol = last_line_width(self.llmout_buf.as_str(), last_wrap_idx) as u16;
-                            self.llmout_buf.push(c);
-                            match c {
-                                '\n' => {
-                                    self.userin.move_down(1);
-                                    self.llmout_numln += 1;
-                                },
-                                _ => {
-                                    let will_wrap = (curscol as usize) + c.width().unwrap_or(0) > tsize.0 as usize;
-                                    if will_wrap {
-                                        last_wrap_idx = self.llmout_buf
-                                            .char_indices()
-                                            .last()
-                                            .unwrap_or((0,'\0')).0;
+                        let LinesInfo {numlines: userin_ln, ..} = self.userin.get_lines_info();
+                        let (_, curscol) = self.llmout_buf.wrapped_width(tsize.0);
+                        //self.userin.clear()?;
 
-                                        self.userin.move_down(1);
-                                        self.llmout_numln += 1;
-                                        curscol = 0;
-                                    }
-
-                                    let _ = queue!(self.stdout,
-                                        cursor::SavePosition,
-                                        cursor::MoveToPreviousLine(numlines as u16),
-                                        cursor::MoveToColumn(curscol),
-                                        style::Print(c),
-                                        cursor::RestorePosition,
-                                    );
-                                }
-                            }
-                        });
-
-                        let _ = self.stdout.flush();
+                        let current_row = tsize.1 - (userin_ln as u16);
+                        self.print(&piece, curscol as u16, current_row)?;
+                        self.llmout_buf.push_str(&piece);
                     }
                 }
             }
@@ -376,10 +350,10 @@ impl TermTask {
 
             // leave with Enter OR CTRL-c
             if let event::Event::Key(ref event) = event {
-                if 
-                event.kind == event::KeyEventKind::Press && 
-                event.code == event::KeyCode::Enter && 
-                event.modifiers == event::KeyModifiers::NONE && 
+                if
+                event.kind == event::KeyEventKind::Press &&
+                event.code == event::KeyCode::Enter &&
+                event.modifiers == event::KeyModifiers::NONE &&
                 self.userin.buf.is_empty() {
                     let _ = tx_tty.send(TermTaskMessage::Die);
                     break;
@@ -407,14 +381,12 @@ impl TermTask {
 
                             self.userin.buf.clear();
                             self.llmout_buf.clear();
-                            self.llmout_numln = 1;
-                            last_wrap_idx = 0;
                             next_polling = Some(PollingMode::AwaitRequestUpdate);
 
-                            self.print_ln(format!("{} {}", UserIn::PREFIX, userin_saved))?;
-                            self.userin.refresh();
-                            self.userin.move_down(1);
-                            
+                            //self.print_ln(format!("{} {}", UserIn::PREFIX, userin_saved))?;
+                            //self.userin.refresh();
+                            //self.userin.move_down(1);
+
                             self.metadata.clear();
 
                             let _ = tx_tty.send(TermTaskMessage::ReceivedUserPrompt {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
@@ -422,7 +394,7 @@ impl TermTask {
 
                         self.userin.count_lines(tsize);
                     }
-                    _ => () 
+                    _ => ()
                 },
                 _ => ()
             }
