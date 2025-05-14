@@ -1,6 +1,7 @@
 mod output_metadata_gen;
 mod str_ext;
 
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use str_ext::StrExt;
 use std::io::{stdout, Stdout, Write};
 use std::time::Duration;
@@ -25,6 +26,10 @@ struct LinesInfo {
 
 struct UserIn {
     buf: String,
+    /// Represents the distance from the bottom row to the last output_row + 1
+    /// This is used to calculate to always redraw multiline userin at the same row
+    /// can only increase or be reset
+    dist_to_output: u32,
     lines_info: LinesInfo,
     stdout: Stdout
 }
@@ -39,37 +44,17 @@ impl UserIn {
                 numlines: 1,
                 last_ln_width: 0,
             },
+            dist_to_output: 0,
             stdout: stdout(),
         }
     }
 
-    fn refresh(&mut self) {
-        let _ = execute!(
-            self.stdout,
-            terminal::Clear(terminal::ClearType::CurrentLine),
-            cursor::MoveToColumn(0),
-            style::Print(format!("{} {}", Self::PREFIX, self.buf.as_str()))
-        );
+    fn reset(&mut self) {
+        self.buf = String::new();
+        self.dist_to_output = 1;
+        self.lines_info.numlines = 1;
+        self.lines_info.last_ln_width = 0;
     }
-
-    fn clear(&mut self) -> std::io::Result<()> {
-        execute!(self.stdout,
-           terminal::Clear(terminal::ClearType::FromCursorDown),
-       )?;
-
-       Ok(())
-    }
-
-    //fn move_down(&mut self, n: u16) {
-    //    let _ = execute!(self.stdout,
-    //        style::Print("\n"), // < forces a one line scroll
-    //        cursor::MoveToPreviousLine(n),
-    //        terminal::Clear(terminal::ClearType::CurrentLine),
-    //        cursor::MoveToNextLine(n),
-    //    );
-
-    //    let _ = execute!(self.stdout, style::Print(format!("{} {}", Self::PREFIX, self.buf)));
-    //}
 
     // actively recounts userin lines, use this if userin buffer has been modified, otherwise used
     // cached get_lines_info
@@ -78,6 +63,8 @@ impl UserIn {
 
         // might happen if the buffer is empty, lines would be an empty iterator
         if numrows == 0 { numrows = 1; }
+
+        if numrows > self.dist_to_output { self.dist_to_output = numrows; }
 
         let lines_info = LinesInfo {
             numlines: numrows.into(),
@@ -90,78 +77,6 @@ impl UserIn {
     fn get_lines_info(&self) -> LinesInfo {
         self.lines_info.clone()
     }
-
-    fn prepare_ui(&mut self) -> std::io::Result<()> {
-        print!("{} ", Self::PREFIX);
-        self.stdout.flush()?;
-        Ok(())
-    }
-
-    fn remove_last(&mut self, tsize: (u16, u16)) {
-        let popped = self.buf.pop().unwrap_or('\0');
-        let LinesInfo {numlines, last_ln_width} = self.count_lines(tsize);
-
-        if popped == '\n' {
-            let _ = execute!(
-                self.stdout,
-                terminal::Clear(terminal::ClearType::CurrentLine),
-                cursor::MoveToPreviousLine(1),
-                cursor::MoveToColumn(last_ln_width as u16)
-            );
-
-            return;
-        }
-
-        if numlines <= 1 {
-            if let Some('\n') = self.buf.chars().last() {
-                self.buf.pop();
-                self.count_lines(tsize);
-                let _ = execute!(
-                    self.stdout,
-                    terminal::Clear(terminal::ClearType::CurrentLine),
-                    cursor::MoveToPreviousLine(1),
-                    cursor::MoveToColumn((self.buf.as_str().width() + Self::PREFIX.width() + 1) as u16)
-                );
-            } else {
-                self.refresh();
-            }
-        } else {
-            let mut line_start_byte = 0;
-            let mut pv_char: char = '\0';
-            let mut curr_width = UserIn::PREFIX.width() + 1;
-            for (i, c) in self.buf.char_indices() {
-                let w = c.width().unwrap_or(0);
-                if pv_char == '\n' || curr_width + w > (tsize.0) as usize {
-                    curr_width = w;
-                    line_start_byte = i;
-                } else {
-                    curr_width += w;
-                }
-                pv_char = c;
-            }
-
-            if curr_width == tsize.0 as usize || pv_char == '\n' {
-                if pv_char == '\n' {
-                    self.buf.pop();
-                    self.count_lines(tsize);
-                }
-
-                let _ = execute!(
-                    self.stdout,
-                    terminal::Clear(terminal::ClearType::CurrentLine),
-                    cursor::MoveToPreviousLine(1),
-                    cursor::MoveToColumn(curr_width as u16)
-                );
-            } else {
-                let _ = execute!(
-                    self.stdout,
-                    cursor::MoveToColumn(0),
-                    terminal::Clear(terminal::ClearType::CurrentLine),
-                    style::Print(&self.buf[line_start_byte..])
-                );
-            }
-        }
-    }
 }
 
 pub enum TermTaskMessage {
@@ -172,6 +87,7 @@ pub enum TermTaskMessage {
     Die,
 }
 
+#[allow(unused)]
 pub struct TermTask {
     userin: UserIn,
     llmout_buf: String,
@@ -179,6 +95,7 @@ pub struct TermTask {
     ctx: Context,
     polling_mode: PollingMode,
     metadata: OutputMetadata,
+    tsize: (u16, u16),
 }
 
 impl TermTask {
@@ -190,18 +107,36 @@ impl TermTask {
             ctx,
             polling_mode: PollingMode::AwaitRequestUpdate,
             metadata: OutputMetadata::new(),
+            tsize: (0, 0),
         }
     }
 
-    // Writes a piece on screen at position with proper wrapping and cursor movement
-    pub fn print(&mut self, s: &str, col: u16, row: u16) -> std::io::Result<()> {
-        let _ = queue!(self.stdout, cursor::MoveTo(col, row));
+    // Writes a piece on screen at position with proper wrapping and cursor movement,
+    // scrolling at each newline
+    pub fn print(&mut self, s: &str, mut col: u16, row: u16) -> std::io::Result<()> {
+        queue!(self.stdout, cursor::MoveTo(col, row))?;
 
         for c in s.chars() {
-            queue!(self.stdout, style::Print(c))?;
+            // when the row on which we print is not the last one we must force a scroll in case of newline
+            let w = c.width().unwrap_or(0) as u16;
+            let will_wrap = col + w > self.tsize.0 || c == '\n';
+            if will_wrap {
+                queue!(self.stdout,
+                    cursor::SavePosition,
+                    cursor::MoveToRow(self.tsize.1-1),
+                    style::Print('\n'),
+                    cursor::RestorePosition,
+                    cursor::MoveToColumn(0)
+                )?;
+                col = 0;
+            }
+
             match c {
-                '\n' => { queue!(self.stdout, cursor::MoveToColumn(0))?; },
-                _ => {}
+                '\n' => {/* Case already handled above */},
+                _ => {
+                    queue!(self.stdout, style::Print(c))?;
+                    col += w;
+                }
             }
         }
 
@@ -209,20 +144,48 @@ impl TermTask {
         Ok(())
     }
 
-    //fn print_ln(&mut self, s: String) -> std::io::Result<()> {
-    //    let tsize = terminal::size()?;
-    //    let LinesInfo {numlines, ..} = self.userin.get_lines_info();
-    //    let strwidth = s.as_str().width();
-    //    let strnrow = (strwidth / (tsize.0 as usize) + 1) as u16;
-    //    self.userin.move_down(strnrow);
-    //    execute!(self.stdout,
-    //        cursor::SavePosition,
-    //        cursor::MoveToPreviousLine(numlines as u16),
-    //        style::Print(format!("{s}\n")),
-    //        cursor::RestorePosition,
-    //    )?;
-    //    Ok(())
-    //}
+    fn clear_userin(&mut self) -> std::io::Result<()> {
+        queue!(self.stdout, cursor::SavePosition)?;
+
+        let dist_to_output = self.userin.dist_to_output.clamp(0, u16::MAX as u32) as u16;
+        // Will crash if the input is outside of the screen upwards !!! will be fixed
+        let userin_top = self.tsize.1 - dist_to_output;
+
+        for n in userin_top..self.tsize.1+1 {
+            queue!(self.stdout,
+                cursor::MoveToRow(n),
+                terminal::Clear(terminal::ClearType::CurrentLine),
+            )?;
+        }
+
+        queue!(self.stdout, cursor::RestorePosition)?;
+        self.stdout.flush()?;
+        Ok(())
+    }
+
+    /// print_userin is meant to be called when userin is non-existent or has been previously cleared, otherwise use refresh
+    /// It draws the userin line at the last row
+    fn print_userin(&mut self) -> std::io::Result<()> {
+        let userin_str = format!("{} {}", UserIn::PREFIX, self.userin.buf.as_str());
+        self.print(&userin_str, 0, self.tsize.1)?;
+        Ok(())
+    }
+
+    /// The refresh function is meant to be called in an input round, it redraws the userin always at a fixed point
+    fn refresh_userin(&mut self) -> std::io::Result<()> {
+        self.clear_userin()?;
+        let userin_str = format!("{} {}", UserIn::PREFIX, self.userin.buf.as_str());
+        let dist_to_output = self.userin.dist_to_output.clamp(0, u16::MAX as u32) as u16;
+
+        let _ = disable_raw_mode();
+        execute!(self.stdout,
+            cursor::MoveTo(0, self.tsize.1 - dist_to_output),
+            style::Print(userin_str)
+        )?;
+        let _ = enable_raw_mode();
+
+        Ok(())
+    }
 
     fn output_idx_to_term_pos(&self, tsize: (u16, u16), output_str_idx: usize) -> (u16, u16) {
         let mut idx_row = 0;
@@ -251,7 +214,6 @@ impl TermTask {
     pub fn run(mut self, tx_tty: Sender<TermTaskMessage>, rx_ans: Receiver<RequestTaskMessage>) -> std::io::Result<()> {
         // make some room
         println!("");
-        self.userin.prepare_ui()?;
         terminal::enable_raw_mode()?;
 
         let supports_keyboard_enhancement = matches!(
@@ -279,6 +241,7 @@ impl TermTask {
             }
 
             let tsize = terminal::size()?;
+            self.tsize = tsize;
             let message: Option<RequestTaskMessage> = match self.polling_mode {
                 PollingMode::AwaitRequestUpdate => rx_ans.recv_timeout(Duration::from_millis(30)).map_or(None, |o| Some(o)),
                 // try_recv out of safety but we could just return None
@@ -329,13 +292,15 @@ impl TermTask {
                         next_polling = Some(PollingMode::AwaitUserin);
                     },
                     RequestTaskMessage::ReceivedPiece(piece) => {
+                        self.clear_userin()?;
+
                         let LinesInfo {numlines: userin_ln, ..} = self.userin.get_lines_info();
                         let (_, curscol) = self.llmout_buf.wrapped_width(tsize.0);
-                        //self.userin.clear()?;
-
-                        let current_row = tsize.1 - (userin_ln as u16);
+                        let current_row = tsize.1 - (userin_ln as u16) - 1;
                         self.print(&piece, curscol as u16, current_row)?;
                         self.llmout_buf.push_str(&piece);
+
+                        self.print_userin()?;
                     }
                 }
             }
@@ -362,32 +327,39 @@ impl TermTask {
                     let _ = tx_tty.send(TermTaskMessage::Die);
                     break;
                 }
-            }
+        }
 
             match event {
                 event::Event::Key(evt) if evt.kind != event::KeyEventKind::Release => match evt.code {
                     event::KeyCode::Char(c) => {
                         self.userin.buf.push(c);
-                        let _ = execute!(self.stdout, style::Print(c));
+                        self.userin.count_lines(self.tsize);
+                        execute!(self.stdout, style::Print(c))?;
                     }
-                    event::KeyCode::Backspace => { self.userin.remove_last(tsize); },
+                    event::KeyCode::Backspace => {
+                        self.userin.buf.pop();
+                        self.userin.count_lines(self.tsize);
+                        self.refresh_userin()?;
+                    },
                     event::KeyCode::Enter => {
                         if evt.modifiers == event::KeyModifiers::SHIFT {
                             self.userin.buf.push('\n');
-                            let _ = execute!(self.stdout, style::Print('\n'), cursor::MoveToColumn(0));
+                            self.userin.count_lines(self.tsize);
+                            execute!(self.stdout, style::Print('\n'), cursor::MoveToColumn(0))?;
                         } else {
-                            let userin_saved = self.userin.buf.clone();
-                            let llmout_saved = self.llmout_buf.clone();
-
-                            self.userin.buf.clear();
-                            self.llmout_buf.clear();
                             next_polling = Some(PollingMode::AwaitRequestUpdate);
 
-                            //self.print_ln(format!("{} {}", UserIn::PREFIX, userin_saved))?;
-                            //self.userin.refresh();
-                            //self.userin.move_down(1);
+                            // printing two newlines just shifts current userin up and leaves a blank space for future llm output
+                            self.print("\n\n", 0, tsize.1 - self.userin.get_lines_info().numlines as u16 - 1)?;
 
+                            let llmout_saved = self.llmout_buf.clone();
+                            let userin_saved = self.userin.buf.clone();
+
+                            self.llmout_buf.clear();
                             self.metadata.clear();
+
+                            self.userin.reset();
+                            self.print_userin()?;
 
                             let _ = tx_tty.send(TermTaskMessage::ReceivedUserPrompt {user_prompt: userin_saved, llm_answer_prev: Some(llmout_saved)});
                         }

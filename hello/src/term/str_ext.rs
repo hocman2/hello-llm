@@ -1,4 +1,4 @@
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 pub trait StrExt {
     /// returns the total number of lines, including wrapped lines and the width of the last line
@@ -12,20 +12,15 @@ impl StrExt for str {
         }
 
         let mut ln_width = 0;
-        let ln_num: u32 = self.lines().fold(0, |mut ln_num, ln| {
-            let w = ln.width();
-            ln_num += (w as u32 + t_width as u32 - 1) / (t_width as u32);
-
-            ln_width = w % (t_width as usize);
-            // edge case if it perfectly matches t_width
-            if ln_width == 0 && w > 0 { ln_width = t_width as usize; }
-
-            ln_num
-        });
-
-        // if the last line ends in a newline, the lines iterator would miss this since it cuts after the \n character
-        if self.chars().last().unwrap_or('\0') == '\n' {
-            ln_width = 0;
+        let mut ln_num = 1;
+        for c in self.chars() {
+            let w = c.width().unwrap_or(0);
+            if ln_width + w > t_width as usize || c == '\n' {
+               ln_num += 1;
+               ln_width = w;
+            } else {
+                ln_width += w;
+            }
         }
 
         (ln_num, ln_width)
@@ -42,22 +37,24 @@ mod tests {
 A lazy person decided to...
 
 ";
-        let (_nl, w) = TEST_STR_1.wrapped_width(96);
+        let (nl, w) = TEST_STR_1.wrapped_width(96);
         println!("{TEST_STR_1:?}");
         assert_eq!(w, 0);
+        assert_eq!(nl, 4);
 
         const TEST_STR_2: &'static str = "Once upon a time
 
     ";
-        let (_nl, w) = TEST_STR_2.wrapped_width(96);
+        let (nl, w) = TEST_STR_2.wrapped_width(96);
         println!("{TEST_STR_2:?}");
         assert_eq!(w, 4);
+        assert_eq!(nl, 3);
 
         const TEST_STR_3: &'static str = "Once upon a time
-
     x";
-        let (_nl, w) = TEST_STR_3.wrapped_width(96);
+        let (nl, w) = TEST_STR_3.wrapped_width(96);
         println!("{TEST_STR_3:?}");
         assert_eq!(w, 5);
+        assert_eq!(nl, 2);
     }
 }
