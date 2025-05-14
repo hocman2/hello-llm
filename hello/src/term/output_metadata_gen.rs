@@ -1,8 +1,9 @@
 #[derive(Debug, Clone)]
-struct CodeBlock {
-    lang: Option<String>,
-    start: usize,
-    end: usize,
+#[allow(unused)]
+pub struct CodeBlock {
+    pub lang: Option<String>,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug)]
@@ -48,7 +49,7 @@ impl OutputMetadata {
                     else if let CurrentElement::CodeBlock(ref mut block) = &mut self.curr {
                         self.code_blocks.push(block.clone());
                         self.curr = CurrentElement::None;
-                    } 
+                    }
                 },
                 None => (),
             }
@@ -64,11 +65,7 @@ impl OutputMetadata {
         });
     }
 
-    pub fn get(&self) -> Option<(usize, usize)> {
-        if self.code_blocks.len() == 0 {
-            None
-        } else {
-            Some((self.code_blocks[0].start, self.code_blocks[0].end))
-        }
+    pub fn code_blocks(&self) -> &[CodeBlock] {
+        &self.code_blocks
     }
 }

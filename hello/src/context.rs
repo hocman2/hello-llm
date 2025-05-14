@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::cli::Config;
 use llm_int::LLMContext;
 
+#[allow(unused)]
 struct SharedState {
     piped: Option<String>,
     initial_prompt: String,
@@ -29,10 +30,6 @@ impl Context {
 
     pub fn get_piped_input(&self) -> Option<String> {
         self.shared_state.lock().piped.clone()
-    }
-
-    pub fn has_piped(&self) -> bool {
-        self.shared_state.lock().piped.is_some()
     }
 
     pub fn get_initial_prompt(&self) -> String {

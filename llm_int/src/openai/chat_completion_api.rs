@@ -40,7 +40,7 @@ impl LLMApi for ApiContext {
 
     fn build_response(&self, data: &[u8]) -> (usize, LLMResponse) {
         let data_str = std::str::from_utf8(&data).unwrap();
-        
+
         // Nasty parsing of SSE
         let mut json_data = String::new();
         let mut piece = String::new();
@@ -50,14 +50,14 @@ impl LLMApi for ApiContext {
                 // a whole json object might come in multiple data lines
                 let clean = line.strip_prefix("data:").unwrap_or(line).trim();
                 json_data.push_str(clean);
-            } 
+            }
             else if line.is_empty() && !json_data.is_empty() {
                 // lol that unwrap is dangerous
                 let data_parsed: Response = serde_json::from_str(json_data.trim()).unwrap();
 
                 if let Some(choice) = data_parsed.choices.get(0) {
                     if let Some(message) = choice.message.content_or_refusal() {
-                        // maybe there are multiple json messages in the data ? 
+                        // maybe there are multiple json messages in the data ?
                         // we'll keep iterating
                         piece.push_str(message.as_str());
                     }
@@ -88,6 +88,7 @@ struct Annotation {
 }
 
 #[derive(Deserialize)]
+#[allow(unused)]
 struct MessageRx {
     role: Option<Role>,
     content: Option<String>,
@@ -95,6 +96,7 @@ struct MessageRx {
     annotations: Option<Vec<Annotation>>,
 }
 
+#[allow(unused)]
 impl MessageRx {
     fn is_refusal(&self) -> bool {
         return self.refusal.is_some();
@@ -102,7 +104,7 @@ impl MessageRx {
 
     fn content_or_refusal(&self) -> Option<String> {
        if let Some(_) = &self.refusal {
-            self.refusal.clone() 
+            self.refusal.clone()
         } else if let Some(_) = &self.content {
             self.content.clone()
         } else {
@@ -120,6 +122,7 @@ enum FinishReason {Stop, Length, ContentFilter, ToolCalls, FunctionCalls}
 struct Logprobs {}
 
 #[derive(Deserialize)]
+#[allow(unused)]
 struct Choice {
     finish_reason: Option<FinishReason>,
     index: usize,
@@ -133,6 +136,7 @@ struct Choice {
 struct Usage {}
 
 #[derive(Deserialize)]
+#[allow(unused)]
 struct Response {
     id: String,
     object: String,
